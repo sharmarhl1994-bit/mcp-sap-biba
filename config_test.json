@@ -1,0 +1,55 @@
+{
+  "mcpServers": {
+    "abap-data-mcp": {
+      "command": "node",
+      "args": [
+        "C:\\Users\\pc\\Coding\\mcp-sap-biba\\dist\\index.js"
+      ],
+      "env": {
+        "SAP_URL": "https://192.168.2.26:44396",
+        "SAP_USER": "PRAVAR3",
+        "SAP_PASSWORD": "Biba@12345",
+        "NODE_TLS_REJECT_UNAUTHORIZED": "0"
+      }
+    }
+  },
+  "coworkUserFilesPath": "C:\\Users\\pc\\Claude",
+  "preferences": {
+    "coworkScheduledTasksEnabled": false,
+    "coworkHipaaRestricted": false,
+    "ccdScheduledTasksEnabled": false,
+    "bypassPermissionsGateByAccount": {
+      "07564f0b-c5d0-4928-bd3d-e57a33136d10": false
+    },
+    "coworkWebSearchEnabled": true,
+    "coworkModelAutoFallbackByAccount": {
+      "07564f0b-c5d0-4928-bd3d-e57a33136d10": true
+    },
+    "remoteToolsDeviceName": "desktop-ahkoctt",
+    "epitaxyPrefs": {
+      "ccd-sessions-filter": {
+        "state": {
+          "selectedProjects": []
+        },
+        "version": 0
+      },
+      "starred-local-code-sessions": [],
+      "starred-cowork-spaces": [],
+      "starred-session-groups": [],
+      "dframe-local-slice": {
+        "pinnedOrder": [],
+        "customGroupAssignments": {},
+        "customGroupOrder": {}
+      },
+      "desktop-frame.paneStore.v1": {
+        "state": {
+          "extraPanesByMode": {},
+          "colWeightsByMode": {},
+          "rowSplit": 0.5,
+          "draftNonce": 0
+        },
+        "version": 4
+      }
+    }
+  }
+}

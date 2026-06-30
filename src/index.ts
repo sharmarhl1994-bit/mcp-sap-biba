@@ -1,0 +1,115 @@
+#!/usr/bin/env node
+
+import { config } from 'dotenv';
+import { Server } from '@modelcontextprotocol/sdk/server/index.js';
+import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import {
+  CallToolRequestSchema,
+  ListToolsRequestSchema,
+  McpError,
+  ErrorCode
+} from '@modelcontextprotocol/sdk/types.js';
+import { ADTClient, session_types } from 'abap-adt-api';
+import path from 'path';
+
+import { DataHandlers }   from './handlers/DataHandlers.js';
+import { SystemHandlers } from './handlers/SystemHandlers.js';
+import { resolveAuthConfig } from './lib/auth.js';
+import { logToolError, extractRawResponse } from './lib/logger.js';
+import { parseAdtError } from './lib/errors.js';
+import type { BaseHandler } from './handlers/BaseHandler.js';
+import type { ToolDefinition } from './types/tools.js';
+
+config({ path: path.resolve(__dirname, '../.env') });
+
+async function main() {
+  const auth = resolveAuthConfig();
+
+  const client = new ADTClient(auth.url, auth.user, auth.password, auth.client, auth.language);
+  client.stateful = session_types.stateful;
+
+  const handlers: BaseHandler[] = [
+    new DataHandlers(client),
+    new SystemHandlers(client),
+  ];
+
+  const notifyFn = async (_level: 'info' | 'warning' | 'error', _message: string) => {
+    // No-op by default; wired to server.sendLoggingMessage below once the server exists.
+  };
+  for (const h of handlers) h.setNotify(notifyFn);
+
+  // Build a flat tool-name -> handler map
+  const toolMap = new Map<string, BaseHandler>();
+  const allTools: ToolDefinition[] = [];
+  for (const h of handlers) {
+    for (const tool of h.getTools()) {
+      toolMap.set(tool.name, h);
+      allTools.push(tool);
+    }
+  }
+
+  const server = new Server(
+    {
+      name: 'abap-data-mcp',
+      version: '1.0.0'
+    },
+    {
+      capabilities: {
+        tools: {},
+        logging: {}
+      }
+    }
+  );
+
+  // Rewire notify to actually use the server's logging capability now that it exists
+  const realNotify = async (level: 'info' | 'warning' | 'error', message: string) => {
+    try {
+      await server.sendLoggingMessage({ level, data: message });
+    } catch (_) {}
+  };
+  for (const h of handlers) h.setNotify(realNotify);
+
+  server.setRequestHandler(ListToolsRequestSchema, async () => {
+    return {
+      tools: allTools.map(t => ({
+        name: t.name,
+        description: t.description,
+        inputSchema: t.inputSchema,
+        annotations: t.annotations
+      }))
+    };
+  });
+
+  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    const { name, arguments: args } = request.params;
+    const handler = toolMap.get(name);
+    if (!handler) {
+      throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${name}`);
+    }
+    try {
+      return await handler.validateAndHandle(name, args || {});
+    } catch (error: any) {
+      const info = parseAdtError(error);
+      const { headers, body } = info.httpStatus === 400 ? extractRawResponse(error) : {};
+      logToolError({
+        tool: name,
+        message: info.message,
+        http_status: info.httpStatus,
+        args,
+        raw_headers: headers,
+        raw_body: body
+      });
+      if (error instanceof McpError) throw error;
+      throw new McpError(ErrorCode.InternalError, info.message);
+    }
+  });
+
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+  console.error('abap-data-mcp running on stdio (tools: abap_table, abap_query, login, healthcheck)');
+}
+
+main().catch((err) => {
+  console.error('Fatal error starting abap-data-mcp:', err);
+  process.exit(1);
+});

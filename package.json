@@ -1,0 +1,27 @@
+{
+  "name": "abap-data-mcp",
+  "version": "1.0.0",
+  "description": "Minimal MCP server for SAP ABAP data access via ADT API. Exposes only abap_table, abap_query, login, and healthcheck (subset of DassianInc/dassian-adt).",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node ./dist/index.js",
+    "dev": "npm run build && npx @modelcontextprotocol/inspector node ./dist/index.js"
+  },
+  "keywords": ["sap", "abap", "adt", "mcp", "model-context-protocol", "ai", "claude"],
+  "author": "Generated from DassianInc/dassian-adt (MIT)",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "files": ["dist"],
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.28.0",
+    "abap-adt-api": "^7.1.2",
+    "dotenv": "^16.4.7"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.10",
+    "typescript": "^5.7.3"
+  }
+}
