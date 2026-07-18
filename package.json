@@ -6,7 +6,9 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "start": "node ./dist/index.js",
-    "dev": "npm run build && npx @modelcontextprotocol/inspector node ./dist/index.js"
+    "start:http": "node ./dist/http-server.js",
+    "dev": "npm run build && npx @modelcontextprotocol/inspector node ./dist/index.js",
+    "dev:http": "npm run build && node ./dist/http-server.js"
   },
   "keywords": ["sap", "abap", "adt", "mcp", "model-context-protocol", "ai", "claude"],
   "author": "Generated from DassianInc/dassian-adt (MIT)",
