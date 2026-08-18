@@ -1,6 +1,6 @@
 {
   "mcpServers": {
-    "abap-data-mcp": {
+    "mcp-sap-biba-s4": {
       "command": "node",
       "args": [
         "C:\\Users\\pc\\Coding\\mcp-sap-biba\\dist\\index.js"
@@ -11,6 +11,38 @@
         "SAP_PASSWORD": "Biba@12345",
         "NODE_TLS_REJECT_UNAUTHORIZED": "0"
       }
+    },
+    "mcp-sap-biba-bw": {
+      "command": "node",
+      "args": [
+        "C:\\Users\\pc\\Coding\\mcp-sap-biba-bw\\dist\\index.js"
+      ],
+      "env": {
+        "SAP_URL": "https://192.168.2.32:44376",
+        "SAP_USER": "C_Rahul",
+        "SAP_PASSWORD": "BWP@100",
+        "NODE_TLS_REJECT_UNAUTHORIZED": "0"
+      }
+    },
+    "ariba-vendor": {
+      "command": "cmd",
+      "args": [
+        "/c",
+        "npx",
+        "-y",
+        "mcp-remote",
+        "http://localhost:3001/mcp",
+        "--header",
+        "Authorization: Bearer test-token"
+      ]
+    },
+    "mcp-biba-remote": {
+      "type": "http",
+      "url": "http://localhost:3000/mcp",
+      "headers": {
+        "x-sap-user": "PRAVAR3",
+        "x-sap-password": "Biba@12345"
+      }
     }
   },
   "coworkUserFilesPath": "C:\\Users\\pc\\Claude",
@@ -18,12 +50,17 @@
     "coworkScheduledTasksEnabled": false,
     "coworkHipaaRestricted": false,
     "ccdScheduledTasksEnabled": false,
+    "sidebarMode": "chat",
     "bypassPermissionsGateByAccount": {
-      "07564f0b-c5d0-4928-bd3d-e57a33136d10": false
+      "07564f0b-c5d0-4928-bd3d-e57a33136d10": false,
+      "4cee72d8-1317-4574-a66f-ce8fa37c47a3": false,
+      "09190c5f-560f-48f4-b975-267e3ce9009c": false
     },
     "coworkWebSearchEnabled": true,
     "coworkModelAutoFallbackByAccount": {
-      "07564f0b-c5d0-4928-bd3d-e57a33136d10": true
+      "07564f0b-c5d0-4928-bd3d-e57a33136d10": true,
+      "4cee72d8-1317-4574-a66f-ce8fa37c47a3": true,
+      "09190c5f-560f-48f4-b975-267e3ce9009c": true
     },
     "remoteToolsDeviceName": "desktop-ahkoctt",
     "epitaxyPrefs": {
@@ -49,6 +86,66 @@
           "draftNonce": 0
         },
         "version": 4
+      },
+      "epitaxy-tasks-store": {
+        "state": {
+          "rowFields": [
+            {
+              "id": "title",
+              "visible": true
+            },
+            {
+              "id": "summary",
+              "visible": true
+            },
+            {
+              "id": "repo",
+              "visible": false
+            },
+            {
+              "id": "diff",
+              "visible": true
+            },
+            {
+              "id": "time",
+              "visible": true
+            }
+          ],
+          "collapsedGroups": {},
+          "groupBy": "status",
+          "groupFilters": {},
+          "layout": "list",
+          "staleThresholdDays": 7,
+          "splitRatio": 60,
+          "prRowFields": [
+            {
+              "id": "title",
+              "visible": true
+            },
+            {
+              "id": "repository",
+              "visible": true
+            },
+            {
+              "id": "modified",
+              "visible": true
+            },
+            {
+              "id": "status",
+              "visible": true
+            },
+            {
+              "id": "auto_toggles",
+              "visible": true
+            }
+          ],
+          "collapsedPrGroups": {},
+          "autoAdvanceAfterAction": false,
+          "defaultSessionViewMode": "transcript",
+          "sidebarCollapsed": true,
+          "sidebarWidth": 240
+        },
+        "version": 16
       }
     }
   }

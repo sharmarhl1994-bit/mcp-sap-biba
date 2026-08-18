@@ -49,7 +49,7 @@ if (!SAP_URL) {
   process.exit(1);
 }
 
-// ── Per-session state ───────────────────────────────────────────────────────
+ 
 
 interface SessionEntry {
   transport: StreamableHTTPServerTransport;
