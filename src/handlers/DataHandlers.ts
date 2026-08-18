@@ -48,19 +48,46 @@ export class DataHandlers extends BaseHandler {
         name: 'get_stock_ledger',
         annotations: { readOnlyHint: true },
         description:
-          'Fetch a complete financial-year stock ledger for one material+plant in a single call. ' +
-          'Runs MAP/MRP, Opening/Closing stock (MARDH+MBEWH), all MATDOC movements, FG (PRDO), RTS, ' +
-          'and Taxable Value queries in PARALLEL and returns one combined result. ' +
-          'Use this INSTEAD OF calling abap_query multiple times for a stock ledger report.',
+          'Fetch a complete financial-year stock ledger for ONE material+plant in a single call. ' +
+          'Runs MAP (MBEW.VERPR), MRP (A938+KONP), Opening/Closing stock (MARDH+MBEWH), all MSEG movements ' +
+          '(STO Outward 641, STO Inward 101, Sales 251/601/633, Sale Reverse, 701/702, 561/562, 309/310), ' +
+          'FG PRDO (AFKO+AFPO), RTS (EKPO+EKKO), and Taxable Value (VBRP+VBRK) in PARALLEL. ' +
+          'Use get_stock_ledger_batch for multi-material reports — do NOT call this in a loop.',
         inputSchema: {
           type: 'object',
           properties: {
             matnr: { type: 'string', description: 'Material number, e.g. PFS10693' },
             plant: { type: 'string', description: 'Plant code, e.g. 1100' },
             fyStartYear: { type: 'number', description: 'Calendar year in which April falls, e.g. 2025 for FY2025-26' },
-            validate: { type: 'boolean', description: 'Run MB5B balance identity check (Closing = Opening + Receipts − Issues). Adds one extra query. Default: false — only set true if numbers look suspicious or user explicitly asks to validate.' }
+            validate: { type: 'boolean', description: 'Run MB5B balance identity check. Default: false.' }
           },
           required: ['matnr', 'plant', 'fyStartYear']
+        }
+      },
+      {
+        name: 'get_stock_ledger_batch',
+        annotations: { readOnlyHint: true },
+        description:
+          'Fetch stock ledger data for UP TO 500 materials in one call using batched IN+GROUP BY queries. ' +
+          'ALL movement columns returned per material: MAP, MRP, Opening/Closing stock qty+value, ' +
+          'STO Outward (641), STO Inward (101), Sales (251/601/633), Sale Reverse (252/602/631/632/634/653), ' +
+          'FG PRDO (AFKO+AFPO WEMNG/WEWRT), RTS (EKPO+EKKO), Taxable Value (VBRP+VBRK KZWI3), ' +
+          '701 up, 702 down, 561/562 net, 309/310. ' +
+          'Use this for ALL multi-material stock ledger reports. ' +
+          'Workflow: (1) get material list from ZSTL_MASTER_DATA, (2) split into batches ≤500, ' +
+          '(3) call this tool once per batch, (4) merge rows by matnr.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            matnrs: {
+              type: 'array',
+              description: 'Array of material numbers (raw or zero-padded, max 500). E.g. ["PFS10693","PFS10694"]',
+              items: { type: 'string' }
+            },
+            plant: { type: 'string', description: 'Plant code, e.g. 1100' },
+            fyStartYear: { type: 'number', description: 'Calendar year in which April falls, e.g. 2025 for FY2025-26' }
+          },
+          required: ['matnrs', 'plant', 'fyStartYear']
         }
       }
     ];
@@ -68,17 +95,16 @@ export class DataHandlers extends BaseHandler {
 
   async handle(toolName: string, args: any): Promise<any> {
     switch (toolName) {
-      case 'abap_query': return this.handleQuery(args);
-      case 'abap_table': return this.handleTable(args);
-      case 'get_stock_ledger': return this.handleStockLedger(args);
+      case 'abap_query':           return this.handleQuery(args);
+      case 'abap_table':           return this.handleTable(args);
+      case 'get_stock_ledger':     return this.handleStockLedger(args);
+      case 'get_stock_ledger_batch': return this.handleStockLedgerBatch(args);
       default: throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${toolName}`);
     }
   }
 
   private async handleQuery(args: any): Promise<any> {
     try {
-      // The library's runQuery() omits Content-Type, causing a 400 on all systems.
-      // Also strip UP TO N ROWS from the SQL — the endpoint uses ?rowNumber instead.
       let sql: string = args.sql || args.query || '';
       let rowNumber: number = args.limit || 100;
       const upToMatch = sql.match(/\bUP\s+TO\s+(\d+)\s+ROWS\b/i);
@@ -98,9 +124,6 @@ export class DataHandlers extends BaseHandler {
             body: sql
           }
         );
-        // Use parseQueryResponse only (not decodeQueryResult) — decodeQueryResult calls
-        // decodeSapDate which crashes on undefined when a DATE column has a null value.
-        // Raw YYYYMMDD strings are fine for the LLM.
         return parseQueryResponse(response.body);
       });
       return this.success({ result });
@@ -111,13 +134,6 @@ export class DataHandlers extends BaseHandler {
     }
   }
 
-  /**
-   * When a query fails with "Unknown column name", fetch the table/view's actual field list
-   * and append it to the error — turning a dead-end error into a self-correcting one
-   * (the caller sees the real columns and retries instead of escalating to abap_run).
-   * Returns '' if the error isn't an unknown-column error, the table name is unknown, or
-   * field discovery fails. Best-effort: never throws.
-   */
   private async unknownColumnHint(tableName: string | undefined, error: any): Promise<string> {
     const msg = String(error?.message || '').toLowerCase();
     if (!tableName || !msg.includes('unknown column name')) return '';
@@ -136,9 +152,7 @@ export class DataHandlers extends BaseHandler {
       if (cols.length) {
         return ` Available columns on ${tableName.toUpperCase()}: ${cols.join(', ')}.`;
       }
-    } catch (_) {
-      // Discovery failed (e.g. structure, cluster table, or the name itself is wrong) — no hint.
-    }
+    } catch (_) {}
     return '';
   }
 
@@ -146,7 +160,6 @@ export class DataHandlers extends BaseHandler {
     try {
       const limit = args.limit || 100;
       const where = args.where || '';
-      // tableContents rejects LIKE/BETWEEN in WHERE — route through datapreview/freestyle instead
       const needsFreestyle = /\bLIKE\b|\bBETWEEN\b/i.test(where);
       if (needsFreestyle || where) {
         const sql = where
@@ -176,10 +189,7 @@ export class DataHandlers extends BaseHandler {
       this.fail(formatError(`abap_table(${args.name})`, error) + hint);
     }
   }
-  /**
-     * Runs a raw SQL string through the ADT freestyle endpoint and parses the result.
-     * Shared by handleQuery() and handleStockLedger().
-     */
+
   private async runRawSql(sql: string, rowNumber: number = 500): Promise<any> {
     const h = (this.adtclient as any).h;
     return this.withSession(async () => {
@@ -196,172 +206,406 @@ export class DataHandlers extends BaseHandler {
     });
   }
 
-  /**
-   * India FY: LFMON 01=April ... 12=March. LFGJA = year in which April falls.
-   */
+  /** India FY: LFMON 01=April ... 12=March. LFGJA = year in which April falls. */
   private getFYPeriods(fyStartYear: number) {
     return {
-      openingLfgja: String(fyStartYear - 1), openingLfmon: '12', // March of prior FY
-      closingLfgja: String(fyStartYear), closingLfmon: '12',     // March of current FY
+      openingLfgja: String(fyStartYear - 1), openingLfmon: '12',
+      closingLfgja: String(fyStartYear),     closingLfmon: '12',
       budatFrom: `${fyStartYear}0401`,
-      budatTo: `${fyStartYear + 1}0331`,
+      budatTo:   `${fyStartYear + 1}0331`,
     };
   }
 
-  /**
-   * MARDH with fallback scan. Fast path: try LFMON=12 first (works 95%+ of the time).
-   * Slow path only triggers when LFMON=12 genuinely has no record — so normal
-   * requests never pay the extra latency.
-   */
+  /** MARDH with fallback scan for single-material use. */
   private async getMardhWithFallback(matnrPadded: string, plant: string, lfgja: string): Promise<any> {
     let result = await this.runRawSql(
       `SELECT WERKS, LGORT, LABST FROM MARDH WHERE MATNR = '${matnrPadded}' AND WERKS = '${plant}' AND LFGJA = '${lfgja}' AND LFMON = '12'`
     );
     if (result?.values?.length) return result;
-
     for (let lfmon = 11; lfmon >= 1; lfmon--) {
-      const lfmonPadded = String(lfmon).padStart(2, '0');
+      const lm = String(lfmon).padStart(2, '0');
       result = await this.runRawSql(
-        `SELECT WERKS, LGORT, LABST FROM MARDH WHERE MATNR = '${matnrPadded}' AND WERKS = '${plant}' AND LFGJA = '${lfgja}' AND LFMON = '${lfmonPadded}'`
+        `SELECT WERKS, LGORT, LABST FROM MARDH WHERE MATNR = '${matnrPadded}' AND WERKS = '${plant}' AND LFGJA = '${lfgja}' AND LFMON = '${lm}'`
       );
       if (result?.values?.length) return result;
     }
-    return { values: [] }; // truly no record anywhere in the FY — Qty = 0
+    return { values: [] };
   }
 
-  /**
-   * Composite tool: fires every stock-ledger sub-query IN PARALLEL (Promise.all)
-   * instead of Claude calling abap_query 8-10+ times sequentially.
-   */
+  // ─── Single-material stock ledger (fixed field names and movement types) ──────
+
   private async handleStockLedger(args: any): Promise<any> {
     try {
       const { matnr, plant } = args;
       const fyStartYear: number = args.fyStartYear;
       const validate: boolean = !!args.validate;
       const p = this.getFYPeriods(fyStartYear);
-      const matnrPadded = String(matnr).padStart(18, '0');
+      const m = String(matnr).padStart(18, '0');
 
-      const sql = {
-        map: `SELECT Material, Plant, MovingAveragePrice FROM I_ProductValuation WHERE Material = '${matnrPadded}' AND Plant = '${plant}'`,
-        openingMbewh: `SELECT BWKEY, LBKUM, SALK3 FROM MBEWH WHERE MATNR = '${matnrPadded}' AND BWKEY = '${plant}' AND LFGJA = '${p.openingLfgja}' AND LFMON = '${p.openingLfmon}'`,
-        closingMbewh: `SELECT BWKEY, LBKUM, SALK3 FROM MBEWH WHERE MATNR = '${matnrPadded}' AND BWKEY = '${plant}' AND LFGJA = '${p.closingLfgja}' AND LFMON = '${p.closingLfmon}'`,
-        matdoc: `SELECT BWART, SHKZG, KZBWS, MENGE, DMBTR FROM MATDOC WHERE MATNR = '${matnrPadded}' AND WERKS = '${plant}' AND BUDAT BETWEEN '${p.budatFrom}' AND '${p.budatTo}' AND BWART IN ('541','251','601','252','602','701','702','561','562','309')`,
-        afpo: `SELECT PWERK, MATNR, PSMNG, WEWRT FROM AFPO WHERE PWERK = '${plant}' AND MATNR = '${matnrPadded}' AND DGLTP BETWEEN '${p.budatFrom}' AND '${p.budatTo}'`,
-        taxable: `SELECT SUM( VBRP~KZWI3 ) AS TAXABLE_VALUE FROM VBRP INNER JOIN VBRK ON VBRP~VBELN = VBRK~VBELN WHERE VBRP~MATNR = '${matnrPadded}' AND VBRP~WERKS = '${plant}' AND VBRK~ERDAT BETWEEN '${p.budatFrom}' AND '${p.budatTo}'`,
-        rts: `SELECT EKPO~EBELN, EKPO~MENGE, EKPO~NETWR FROM EKPO INNER JOIN EKKO ON EKPO~EBELN = EKKO~EBELN WHERE EKPO~MATNR = '${matnrPadded}' AND EKPO~WERKS = '${plant}' AND EKKO~BSART IN ('ZCAP','ZCON','ZDFG','ZMRP','ZPKG','ZPRO','ZRAW','ZRET','ZSER','ZSUB') AND EKKO~AEDAT BETWEEN '${p.budatFrom}' AND '${p.budatTo}'`,
-        identity: `SELECT SUM(CASE WHEN SHKZG='S' THEN MENGE ELSE 0 END) AS RECEIPTS, SUM(CASE WHEN SHKZG='H' THEN MENGE ELSE 0 END) AS ISSUES FROM MATDOC WHERE MATNR = '${matnrPadded}' AND WERKS = '${plant}' AND BUDAT BETWEEN '${p.budatFrom}' AND '${p.budatTo}'`,
-      };
-
-      // MRP needs 2 chained calls (A938 -> KONP) but still runs alongside everything else.
       const mrpFetch = (async () => {
         const a938 = await this.runRawSql(
-          `SELECT KNUMH FROM A938 WHERE KSCHL = 'ZMRP' AND KAPPL = 'V' AND MATNR = '${matnrPadded}' ORDER BY DATAB DESCENDING UP TO 1 ROWS`
+          `SELECT KNUMH FROM A938 WHERE KSCHL = 'ZMRP' AND KAPPL = 'V' AND MATNR = '${m}' ORDER BY DATAB DESCENDING UP TO 1 ROWS`
         );
         const knumh = a938?.values?.[0]?.KNUMH;
         if (!knumh) return null;
         return this.runRawSql(`SELECT KBETR FROM KONP WHERE KNUMH = '${knumh}'`);
       })();
 
-      // Everything independent fires at once. Validation identity only runs if asked for.
       const [
-        map, openingMardh, openingMbewh, closingMardh, closingMbewh,
-        matdoc, afpo, taxable, rts, mrp, identity,
+        mapR, openMardhR, openMbewhR, closeMardhR, closeMbewhR,
+        msegR, stoInR, fgR, rtsR, taxR, mrpR, identityR,
       ] = await Promise.all([
-        this.runRawSql(sql.map),
-        this.getMardhWithFallback(matnrPadded, plant, p.openingLfgja),
-        this.runRawSql(sql.openingMbewh),
-        this.getMardhWithFallback(matnrPadded, plant, p.closingLfgja),
-        this.runRawSql(sql.closingMbewh),
-        this.runRawSql(sql.matdoc, 2000),
-        this.runRawSql(sql.afpo),
-        this.runRawSql(sql.taxable),
-        this.runRawSql(sql.rts),
+        // MAP — MBEW.VERPR (not I_ProductValuation)
+        this.runRawSql(`SELECT MATNR, VERPR FROM MBEW WHERE MATNR = '${m}' AND BWKEY = '${plant}' AND BWTAR = ''`),
+        this.getMardhWithFallback(m, plant, p.openingLfgja),
+        this.runRawSql(`SELECT BWKEY, LBKUM, SALK3 FROM MBEWH WHERE MATNR = '${m}' AND BWKEY = '${plant}' AND BWTAR = '' AND LFGJA = '${p.openingLfgja}' AND LFMON = '${p.openingLfmon}'`),
+        this.getMardhWithFallback(m, plant, p.closingLfgja),
+        this.runRawSql(`SELECT BWKEY, LBKUM, SALK3 FROM MBEWH WHERE MATNR = '${m}' AND BWKEY = '${plant}' AND BWTAR = '' AND LFGJA = '${p.closingLfgja}' AND LFMON = '${p.closingLfmon}'`),
+        // MSEG — all movements in one query (MATBF not MATNR, SALK3 for values)
+        this.runRawSql(
+          `SELECT BWART, SHKZG, XAUTO, MENGE, SALK3 FROM MSEG ` +
+          `WHERE MATBF = '${m}' AND WERKS = '${plant}' ` +
+          `AND BUDAT BETWEEN '${p.budatFrom}' AND '${p.budatTo}' ` +
+          `AND BWART IN ('251','252','309','310','561','562','601','602','631','632','633','634','641','653','701','702')`,
+          5000
+        ),
+        // STO Inward: MSEG 101 joined with EKKO STO document types
+        this.runRawSql(
+          `SELECT SUM( MSEG~MENGE ) AS STO_IN_QTY ` +
+          `FROM MSEG INNER JOIN EKKO ON MSEG~EBELN = EKKO~EBELN ` +
+          `WHERE MSEG~MATBF = '${m}' AND MSEG~WERKS = '${plant}' ` +
+          `AND MSEG~BWART = '101' AND MSEG~XAUTO = '' ` +
+          `AND MSEG~BUDAT BETWEEN '${p.budatFrom}' AND '${p.budatTo}' ` +
+          `AND EKKO~BSART IN ('ZITR','ZITS','ZRTW','ZRTV','ZIBT','ZIBI','ZFRC','ZFRT','ZASI','ZAST','ZBAS')`
+        ),
+        // FG PRDO — AFPO+AFKO join, WEMNG (not PSMNG), AFKO.STRMP (not DGLTP)
+        this.runRawSql(
+          `SELECT SUM( AFPO~WEMNG ) AS FG_QTY, SUM( AFPO~WEWRT ) AS FG_VALUE ` +
+          `FROM AFPO INNER JOIN AFKO ON AFPO~AUFNR = AFKO~AUFNR ` +
+          `WHERE AFPO~PWERK = '${plant}' AND AFPO~MATNR = '${m}' ` +
+          `AND AFKO~STRMP BETWEEN '${p.budatFrom}' AND '${p.budatTo}'`
+        ),
+        // RTS — EKPO+EKKO, BSART without ZCAP/ZCON
+        this.runRawSql(
+          `SELECT SUM( EKPO~MENGE ) AS RTS_QTY, SUM( EKPO~NETWR ) AS RTS_VALUE ` +
+          `FROM EKPO INNER JOIN EKKO ON EKPO~EBELN = EKKO~EBELN ` +
+          `WHERE EKPO~MATNR = '${m}' AND EKPO~WERKS = '${plant}' ` +
+          `AND EKKO~BSART IN ('ZDFG','ZMRP','ZPKG','ZPRO','ZRAW','ZRET','ZSER','ZSUB') ` +
+          `AND EKKO~AEDAT BETWEEN '${p.budatFrom}' AND '${p.budatTo}'`
+        ),
+        // Taxable Value — VBRP+VBRK join, KZWI3
+        this.runRawSql(
+          `SELECT SUM( VBRP~KZWI3 ) AS TAXABLE_VALUE FROM VBRP INNER JOIN VBRK ON VBRP~VBELN = VBRK~VBELN ` +
+          `WHERE VBRP~MATNR = '${m}' AND VBRP~WERKS = '${plant}' ` +
+          `AND VBRK~ERDAT BETWEEN '${p.budatFrom}' AND '${p.budatTo}'`
+        ),
         mrpFetch,
-        validate ? this.runRawSql(sql.identity) : Promise.resolve(null),
+        validate
+          ? this.runRawSql(
+              `SELECT SUM( CASE WHEN SHKZG = 'S' THEN MENGE ELSE 0 END ) AS RECEIPTS, ` +
+              `SUM( CASE WHEN SHKZG = 'H' THEN MENGE ELSE 0 END ) AS ISSUES FROM MSEG ` +
+              `WHERE MATBF = '${m}' AND WERKS = '${plant}' AND BUDAT BETWEEN '${p.budatFrom}' AND '${p.budatTo}'`
+            )
+          : Promise.resolve(null),
       ]);
 
-      const result = this.assembleLedger({
-        map, openingMardh, openingMbewh, closingMardh, closingMbewh,
-        matdoc, afpo, taxable, rts, mrp, identity, validate,
-      });
+      const map = Number(mapR?.values?.[0]?.VERPR) || 0;
+      const mrp = Number(mrpR?.values?.[0]?.KBETR) || 0;
+      const openingQty   = this.sumLabst(openMardhR);
+      const closingQty   = this.sumLabst(closeMardhR);
+      const openingValue = Number(openMbewhR?.values?.[0]?.SALK3) || openingQty * map;
+      const closingValue = Number(closeMbewhR?.values?.[0]?.SALK3) || closingQty * map;
+      const buckets      = this.bucketMseg(msegR);
+      const stoInQty     = Number(stoInR?.values?.[0]?.STO_IN_QTY) || 0;
+      const fgPrdoQty    = Number(fgR?.values?.[0]?.FG_QTY) || 0;
+      const fgPrdoValue  = Number(fgR?.values?.[0]?.FG_VALUE) || 0;
+      const rtsQty       = Number(rtsR?.values?.[0]?.RTS_QTY) || 0;
+      const rtsValue     = Number(rtsR?.values?.[0]?.RTS_VALUE) || 0;
+      const taxableValue = Number(taxR?.values?.[0]?.TAXABLE_VALUE) || 0;
+
+      const result: any = {
+        map, mrp,
+        openingQty, openingValue,
+        closingQty, closingValue,
+        stoOutQty:   buckets.stoOutQty,  stoOutValue:  buckets.stoOutQty * map,
+        stoInQty,                         stoInValue:   stoInQty * map,
+        saleQty:     buckets.saleQty,    saleMrpValue: buckets.saleQty * mrp,
+        saleRevQty:  buckets.saleRevQty, saleRevValue: buckets.saleRevQty * mrp,
+        qty701Up:    buckets.qty701Up,
+        qty702Down:  buckets.qty702Down, val702:        buckets.val702,
+        net561_562Qty:   buckets.net561_562Qty,
+        net561_562Value: buckets.net561_562Value,
+        qty309_310:  buckets.qty309_310, val309_310:   buckets.val309_310,
+        fgPrdoQty, fgPrdoValue,
+        rtsQty, rtsValue,
+        taxableValue,
+      };
+
+      if (validate && identityR) {
+        const receipts = Number(identityR?.values?.[0]?.RECEIPTS) || 0;
+        const issues   = Number(identityR?.values?.[0]?.ISSUES) || 0;
+        const expected = openingQty + receipts - issues;
+        result.balanceCheck = {
+          expectedClosingQty: expected,
+          actualClosingQty:   closingQty,
+          matches: Math.abs(expected - closingQty) < 0.001,
+        };
+      }
+
       return this.success({ result });
     } catch (error: any) {
       this.fail(formatError('get_stock_ledger', error));
     }
   }
 
-  /** Sums LABST across all LGORT rows returned by a MARDH query. */
-  private sumLabst(parsed: any): number {
-    return (parsed?.values || []).reduce((sum: number, r: any) => sum + (Number(r.LABST) || 0), 0);
+  // ─── Batch stock ledger ────────────────────────────────────────────────────────
+
+  private async handleStockLedgerBatch(args: any): Promise<any> {
+    try {
+      const { matnrs, plant, fyStartYear } = args;
+      if (!Array.isArray(matnrs) || matnrs.length === 0) throw new Error('matnrs must be a non-empty array');
+      if (matnrs.length > 500) throw new Error('Maximum 500 materials per batch — split into smaller batches');
+
+      const p = this.getFYPeriods(fyStartYear);
+      const padded = (matnrs as string[]).map(x => String(x).padStart(18, '0'));
+      const inList = padded.map(x => `'${x}'`).join(',');
+
+      // ── Round 1: all independent queries fire simultaneously ──────────────────
+      const [mapR, a938R, opMardhR, clMardhR, opMbewhR, clMbewhR, msegR, stoInR, rtsR, fgR, taxR] =
+        await Promise.all([
+          // MAP — MBEW.VERPR
+          this.runRawSql(
+            `SELECT MATNR, VERPR FROM MBEW WHERE MATNR IN (${inList}) AND BWKEY = '${plant}' AND BWTAR = ''`,
+            600
+          ),
+          // MRP step 1 — A938: all records for the materials; JS picks most-recent per MATNR
+          this.runRawSql(
+            `SELECT MATNR, KNUMH, DATAB FROM A938 WHERE KSCHL = 'ZMRP' AND KAPPL = 'V' AND MATNR IN (${inList})`,
+            5000
+          ),
+          // Opening stock qty — MARDH, SUM across LGORTs
+          this.runRawSql(
+            `SELECT MATNR, SUM( LABST ) AS OPENING_QTY FROM MARDH ` +
+            `WHERE MATNR IN (${inList}) AND WERKS = '${plant}' ` +
+            `AND LFGJA = '${p.openingLfgja}' AND LFMON = '${p.openingLfmon}' GROUP BY MATNR`,
+            600
+          ),
+          // Closing stock qty — MARDH
+          this.runRawSql(
+            `SELECT MATNR, SUM( LABST ) AS CLOSING_QTY FROM MARDH ` +
+            `WHERE MATNR IN (${inList}) AND WERKS = '${plant}' ` +
+            `AND LFGJA = '${p.closingLfgja}' AND LFMON = '${p.closingLfmon}' GROUP BY MATNR`,
+            600
+          ),
+          // Opening stock value — MBEWH.SALK3
+          this.runRawSql(
+            `SELECT MATNR, SALK3 AS OPENING_VALUE FROM MBEWH ` +
+            `WHERE MATNR IN (${inList}) AND BWKEY = '${plant}' AND BWTAR = '' ` +
+            `AND LFGJA = '${p.openingLfgja}' AND LFMON = '${p.openingLfmon}'`,
+            600
+          ),
+          // Closing stock value — MBEWH.SALK3
+          this.runRawSql(
+            `SELECT MATNR, SALK3 AS CLOSING_VALUE FROM MBEWH ` +
+            `WHERE MATNR IN (${inList}) AND BWKEY = '${plant}' AND BWTAR = '' ` +
+            `AND LFGJA = '${p.closingLfgja}' AND LFMON = '${p.closingLfmon}'`,
+            600
+          ),
+          // ALL MSEG movement columns in one query via conditional aggregation
+          this.runRawSql(
+            `SELECT MATBF, ` +
+            `SUM( CASE WHEN BWART IN ('251','601','633') AND SHKZG = 'H' THEN MENGE ELSE 0 END ) AS SALE_QTY, ` +
+            `SUM( CASE WHEN BWART IN ('252','602','631','632','634','653') AND SHKZG = 'S' THEN MENGE ELSE 0 END ) AS SALE_REV_QTY, ` +
+            `SUM( CASE WHEN BWART = '641' AND XAUTO = '' THEN MENGE ELSE 0 END ) AS STO_OUT_QTY, ` +
+            `SUM( CASE WHEN BWART = '701' AND SHKZG = 'S' THEN MENGE ELSE 0 END ) AS QTY_701, ` +
+            `SUM( CASE WHEN BWART = '702' AND SHKZG = 'H' THEN MENGE ELSE 0 END ) AS QTY_702, ` +
+            `SUM( CASE WHEN BWART = '702' AND SHKZG = 'H' THEN SALK3 ELSE 0 END ) AS VAL_702, ` +
+            `SUM( CASE WHEN BWART = '561' THEN MENGE ELSE 0 END ) AS QTY_561, ` +
+            `SUM( CASE WHEN BWART = '562' THEN MENGE ELSE 0 END ) AS QTY_562, ` +
+            `SUM( CASE WHEN BWART = '561' THEN SALK3 ELSE 0 END ) AS VAL_561, ` +
+            `SUM( CASE WHEN BWART = '562' THEN SALK3 ELSE 0 END ) AS VAL_562, ` +
+            `SUM( CASE WHEN BWART IN ('309','310') THEN MENGE ELSE 0 END ) AS QTY_309_310, ` +
+            `SUM( CASE WHEN BWART IN ('309','310') THEN SALK3 ELSE 0 END ) AS VAL_309_310 ` +
+            `FROM MSEG WHERE MATBF IN (${inList}) AND WERKS = '${plant}' ` +
+            `AND BUDAT BETWEEN '${p.budatFrom}' AND '${p.budatTo}' GROUP BY MATBF`,
+            2000
+          ),
+          // STO Inward — MSEG BWART=101 + EKKO STO types
+          this.runRawSql(
+            `SELECT MSEG~MATBF AS MATNR, SUM( MSEG~MENGE ) AS STO_IN_QTY ` +
+            `FROM MSEG INNER JOIN EKKO ON MSEG~EBELN = EKKO~EBELN ` +
+            `WHERE MSEG~MATBF IN (${inList}) AND MSEG~WERKS = '${plant}' ` +
+            `AND MSEG~BWART = '101' AND MSEG~XAUTO = '' ` +
+            `AND MSEG~BUDAT BETWEEN '${p.budatFrom}' AND '${p.budatTo}' ` +
+            `AND EKKO~BSART IN ('ZITR','ZITS','ZRTW','ZRTV','ZIBT','ZIBI','ZFRC','ZFRT','ZASI','ZAST','ZBAS') ` +
+            `GROUP BY MSEG~MATBF`,
+            2000
+          ),
+          // RTS — EKPO+EKKO, no ZCAP/ZCON
+          this.runRawSql(
+            `SELECT EKPO~MATNR, SUM( EKPO~MENGE ) AS RTS_QTY, SUM( EKPO~NETWR ) AS RTS_VALUE ` +
+            `FROM EKPO INNER JOIN EKKO ON EKPO~EBELN = EKKO~EBELN ` +
+            `WHERE EKPO~MATNR IN (${inList}) AND EKPO~WERKS = '${plant}' ` +
+            `AND EKKO~BSART IN ('ZDFG','ZMRP','ZPKG','ZPRO','ZRAW','ZRET','ZSER','ZSUB') ` +
+            `AND EKKO~AEDAT BETWEEN '${p.budatFrom}' AND '${p.budatTo}' GROUP BY EKPO~MATNR`,
+            2000
+          ),
+          // FG PRDO — AFPO+AFKO, WEMNG (not PSMNG), filter on AFKO.STRMP
+          this.runRawSql(
+            `SELECT AFPO~MATNR, SUM( AFPO~WEMNG ) AS FG_QTY, SUM( AFPO~WEWRT ) AS FG_VALUE ` +
+            `FROM AFPO INNER JOIN AFKO ON AFPO~AUFNR = AFKO~AUFNR ` +
+            `WHERE AFPO~MATNR IN (${inList}) AND AFPO~PWERK = '${plant}' ` +
+            `AND AFKO~STRMP BETWEEN '${p.budatFrom}' AND '${p.budatTo}' GROUP BY AFPO~MATNR`,
+            2000
+          ),
+          // Taxable Value — VBRP+VBRK, KZWI3
+          this.runRawSql(
+            `SELECT VBRP~MATNR, SUM( VBRP~KZWI3 ) AS TAXABLE_VALUE ` +
+            `FROM VBRP INNER JOIN VBRK ON VBRP~VBELN = VBRK~VBELN ` +
+            `WHERE VBRP~MATNR IN (${inList}) AND VBRP~WERKS = '${plant}' ` +
+            `AND VBRK~ERDAT BETWEEN '${p.budatFrom}' AND '${p.budatTo}' GROUP BY VBRP~MATNR`,
+            2000
+          ),
+        ]);
+
+      // ── Round 2: MRP step 2 — KONP for the KNUMHs found in A938 ─────────────
+      const mrpKnumhMap = this.buildMrpKnumhMap(a938R);
+      const knumhSet = [...new Set(Object.values(mrpKnumhMap))].filter(Boolean);
+      let konpR: any = { values: [] };
+      if (knumhSet.length > 0) {
+        konpR = await this.runRawSql(
+          `SELECT KNUMH, KBETR FROM KONP WHERE KNUMH IN (${knumhSet.map(k => `'${k}'`).join(',')})`,
+          1000
+        );
+      }
+
+      // ── Build lookup maps ─────────────────────────────────────────────────────
+      const mapLkp    = this.toLookupNum(mapR,    'MATNR', 'VERPR');
+      const mrpLkp    = this.buildMrpKbetrLookup(mrpKnumhMap, konpR);
+      const opQtyLkp  = this.toLookupNum(opMardhR, 'MATNR', 'OPENING_QTY');
+      const clQtyLkp  = this.toLookupNum(clMardhR, 'MATNR', 'CLOSING_QTY');
+      const opValLkp  = this.toLookupNum(opMbewhR, 'MATNR', 'OPENING_VALUE');
+      const clValLkp  = this.toLookupNum(clMbewhR, 'MATNR', 'CLOSING_VALUE');
+      const msegLkp   = this.toRowLookup(msegR,   'MATBF');
+      const stoInLkp  = this.toLookupNum(stoInR,  'MATNR', 'STO_IN_QTY');
+      const rtsLkp    = this.toRowLookup(rtsR,    'MATNR');
+      const fgLkp     = this.toRowLookup(fgR,     'MATNR');
+      const taxLkp    = this.toLookupNum(taxR,    'MATNR', 'TAXABLE_VALUE');
+
+      // ── Assemble one row per material ─────────────────────────────────────────
+      const rows = padded.map(matnr => {
+        const map = mapLkp[matnr]   ?? 0;
+        const mrp = mrpLkp[matnr]   ?? 0;
+        const opQty = opQtyLkp[matnr] ?? 0;
+        const clQty = clQtyLkp[matnr] ?? 0;
+        const opVal = opValLkp[matnr] ?? (opQty * map);
+        const clVal = clValLkp[matnr] ?? (clQty * map);
+        const ms = msegLkp[matnr] ?? {};
+        const stoOutQty = Number(ms.STO_OUT_QTY) || 0;
+        const stoInQty  = stoInLkp[matnr] ?? 0;
+        const saleQty   = Number(ms.SALE_QTY) || 0;
+        const saleRevQty = Number(ms.SALE_REV_QTY) || 0;
+        const rt = rtsLkp[matnr]  ?? {};
+        const fg = fgLkp[matnr]   ?? {};
+        return {
+          matnr,
+          map, mrp,
+          openingQty: opQty,    openingValue: opVal,
+          closingQty: clQty,    closingValue: clVal,
+          stoOutQty,            stoOutValue: stoOutQty * map,
+          stoInQty,             stoInValue:  stoInQty  * map,
+          saleQty,              saleMrpValue: saleQty  * mrp,
+          saleRevQty,           saleRevValue: saleRevQty * mrp,
+          qty701Up:   Number(ms.QTY_701)     || 0,
+          qty702Down: Number(ms.QTY_702)     || 0,
+          val702:     Number(ms.VAL_702)     || 0,
+          net561_562Qty:   (Number(ms.QTY_561) || 0) - (Number(ms.QTY_562) || 0),
+          net561_562Value: (Number(ms.VAL_561) || 0) - (Number(ms.VAL_562) || 0),
+          qty309_310: Number(ms.QTY_309_310) || 0,
+          val309_310: Number(ms.VAL_309_310) || 0,
+          rtsQty:     Number(rt.RTS_QTY)     || 0,
+          rtsValue:   Number(rt.RTS_VALUE)   || 0,
+          fgPrdoQty:  Number(fg.FG_QTY)      || 0,
+          fgPrdoValue:Number(fg.FG_VALUE)    || 0,
+          taxableValue: taxLkp[matnr] ?? 0,
+        };
+      });
+
+      return this.success({ rows, count: rows.length, plant, fyStartYear });
+    } catch (error: any) {
+      this.fail(formatError('get_stock_ledger_batch', error));
+    }
   }
 
-  /** Buckets raw MATDOC rows into named report columns — plain deterministic code, no LLM. */
-  private bucketMatdoc(parsed: any) {
+  // ─── Helpers ──────────────────────────────────────────────────────────────────
+
+  private sumLabst(parsed: any): number {
+    return (parsed?.values || []).reduce((s: number, r: any) => s + (Number(r.LABST) || 0), 0);
+  }
+
+  /** Buckets raw MSEG rows into named columns. Uses SALK3 for value fields. */
+  private bucketMseg(parsed: any) {
     const b = {
-      rtvQty: 0, saleQty: 0, saleMrpValue: 0, saleReverseQty: 0,
-      qty701Up: 0, qty702Down: 0, net561_562Qty: 0, net561_562Value: 0, qty309: 0,
+      stoOutQty: 0, saleQty: 0, saleRevQty: 0,
+      qty701Up: 0, qty702Down: 0, val702: 0,
+      net561_562Qty: 0, net561_562Value: 0,
+      qty309_310: 0, val309_310: 0,
     };
     for (const r of parsed?.values || []) {
       const qty = Number(r.MENGE) || 0;
-      const val = Number(r.DMBTR) || 0;
-      if (r.BWART === '541' && r.KZBWS === 'O') b.rtvQty += qty;
-      else if ((r.BWART === '251' || r.BWART === '601') && r.SHKZG === 'H') { b.saleQty += qty; b.saleMrpValue += val; }
-      else if (r.BWART === '252' || r.BWART === '602') b.saleReverseQty += qty;
-      else if (r.BWART === '701' && r.SHKZG === 'S') b.qty701Up += qty;
-      else if (r.BWART === '702' && r.SHKZG === 'H') b.qty702Down += qty;
-      else if (r.BWART === '561') { b.net561_562Qty += qty; b.net561_562Value += val; }
-      else if (r.BWART === '562') { b.net561_562Qty -= qty; b.net561_562Value -= val; }
-      else if (r.BWART === '309') b.qty309 += qty;
+      const val = Number(r.SALK3) || 0;
+      const bw = r.BWART; const sk = r.SHKZG;
+      if (bw === '641' && (r.XAUTO === '' || r.XAUTO == null)) b.stoOutQty += qty;
+      else if ((bw === '251' || bw === '601' || bw === '633') && sk === 'H') b.saleQty += qty;
+      else if ((bw === '252' || bw === '602' || bw === '631' || bw === '632' || bw === '634' || bw === '653') && sk === 'S') b.saleRevQty += qty;
+      else if (bw === '701' && sk === 'S') b.qty701Up += qty;
+      else if (bw === '702' && sk === 'H') { b.qty702Down += qty; b.val702 += val; }
+      else if (bw === '561') { b.net561_562Qty += qty; b.net561_562Value += val; }
+      else if (bw === '562') { b.net561_562Qty -= qty; b.net561_562Value -= val; }
+      else if (bw === '309' || bw === '310') { b.qty309_310 += qty; b.val309_310 += val; }
     }
     return b;
   }
 
-  /** Combines all parallel results + does the small post-fetch derivations. */
-  private assembleLedger(raw: any) {
-    const map = Number(raw.map?.values?.[0]?.MovingAveragePrice) || 0;
-    const mrp = Number(raw.mrp?.values?.[0]?.KBETR) || 0;
-
-    const openingQty = this.sumLabst(raw.openingMardh);
-    const closingQty = this.sumLabst(raw.closingMardh);
-    const openingValue = Number(raw.openingMbewh?.values?.[0]?.SALK3) || openingQty * map;
-    const closingValue = Number(raw.closingMbewh?.values?.[0]?.SALK3) || closingQty * map;
-
-    const buckets = this.bucketMatdoc(raw.matdoc);
-    const rtvValue = buckets.rtvQty * map;
-    const saleReverseValue = buckets.saleReverseQty * mrp;
-
-    const fgPrdoRows = raw.afpo?.values || [];
-    const fgPrdoQty = fgPrdoRows.reduce((s: number, r: any) => s + (Number(r.PSMNG) || 0), 0);
-    const fgPrdoValue = fgPrdoRows.reduce((s: number, r: any) => s + (Number(r.WEWRT) || 0), 0);
-
-    const rtsRows = raw.rts?.values || [];
-    const rtsQty = rtsRows.reduce((s: number, r: any) => s + (Number(r.MENGE) || 0), 0);
-    const rtsValue = rtsRows.reduce((s: number, r: any) => s + (Number(r.NETWR) || 0), 0);
-
-    const taxableValue = Number(raw.taxable?.values?.[0]?.TAXABLE_VALUE) || 0;
-
-    const result: any = {
-      map, mrp,
-      openingQty, openingValue,
-      closingQty, closingValue,
-      ...buckets, rtvValue, saleReverseValue,
-      fgPrdoQty, fgPrdoValue,
-      rtsQty, rtsValue,
-      taxableValue,
-    };
-
-    if (raw.validate && raw.identity) {
-      const receipts = Number(raw.identity?.values?.[0]?.RECEIPTS) || 0;
-      const issues = Number(raw.identity?.values?.[0]?.ISSUES) || 0;
-      const expectedClosing = openingQty + receipts - issues;
-      result.balanceCheck = {
-        expectedClosingQty: expectedClosing,
-        actualClosingQty: closingQty,
-        matches: Math.abs(expectedClosing - closingQty) < 0.001,
-      };
+  /** A938 result → MATNR→KNUMH map, keeping most-recent DATAB per material. */
+  private buildMrpKnumhMap(a938R: any): Record<string, string> {
+    const best: Record<string, { datab: string; knumh: string }> = {};
+    for (const r of a938R?.values || []) {
+      if (!r.MATNR || !r.KNUMH) continue;
+      const prev = best[r.MATNR];
+      if (!prev || r.DATAB > prev.datab) best[r.MATNR] = { datab: r.DATAB, knumh: r.KNUMH };
     }
-
-    return result;
+    const out: Record<string, string> = {};
+    for (const [matnr, { knumh }] of Object.entries(best)) out[matnr] = knumh;
+    return out;
   }
 
+  /** Combine KNUMH map + KONP result → MATNR→MRP lookup. */
+  private buildMrpKbetrLookup(knumhMap: Record<string, string>, konpR: any): Record<string, number> {
+    const knumhToKbetr: Record<string, number> = {};
+    for (const r of konpR?.values || []) {
+      if (r.KNUMH) knumhToKbetr[r.KNUMH] = Number(r.KBETR) || 0;
+    }
+    const out: Record<string, number> = {};
+    for (const [matnr, knumh] of Object.entries(knumhMap)) out[matnr] = knumhToKbetr[knumh] || 0;
+    return out;
+  }
+
+  /** Build MATNR→number lookup from a query result. */
+  private toLookupNum(r: any, keyField: string, valueField: string): Record<string, number> {
+    const out: Record<string, number> = {};
+    for (const row of r?.values || []) {
+      if (row[keyField] != null) out[row[keyField]] = Number(row[valueField]) || 0;
+    }
+    return out;
+  }
+
+  /** Build MATNR→full-row lookup from a query result. */
+  private toRowLookup(r: any, keyField: string): Record<string, any> {
+    const out: Record<string, any> = {};
+    for (const row of r?.values || []) {
+      if (row[keyField] != null) out[row[keyField]] = row;
+    }
+    return out;
+  }
 }
