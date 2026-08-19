@@ -95,9 +95,9 @@ export class DataHandlers extends BaseHandler {
 
   async handle(toolName: string, args: any): Promise<any> {
     switch (toolName) {
-      case 'abap_query':           return this.handleQuery(args);
-      case 'abap_table':           return this.handleTable(args);
-      case 'get_stock_ledger':     return this.handleStockLedger(args);
+      case 'abap_query':             return this.handleQuery(args);
+      case 'abap_table':             return this.handleTable(args);
+      case 'get_stock_ledger':       return this.handleStockLedger(args);
       case 'get_stock_ledger_batch': return this.handleStockLedgerBatch(args);
       default: throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${toolName}`);
     }
@@ -232,7 +232,7 @@ export class DataHandlers extends BaseHandler {
     return { values: [] };
   }
 
-  // ─── Single-material stock ledger (fixed field names and movement types) ──────
+  // ─── Single-material stock ledger ─────────────────────────────────────────────
 
   private async handleStockLedger(args: any): Promise<any> {
     try {
@@ -251,25 +251,75 @@ export class DataHandlers extends BaseHandler {
         return this.runRawSql(`SELECT KBETR FROM KONP WHERE KNUMH = '${knumh}'`);
       })();
 
+      // Validate balance: two separate queries instead of CASE WHEN (ADT doesn't support it)
+      const validateFetch = validate
+        ? Promise.all([
+            this.runRawSql(
+              `SELECT SUM( MENGE ) AS RECEIPTS FROM MSEG ` +
+              `WHERE MATBF = '${m}' AND WERKS = '${plant}' AND SHKZG = 'S' ` +
+              `AND BUDAT BETWEEN '${p.budatFrom}' AND '${p.budatTo}'`
+            ),
+            this.runRawSql(
+              `SELECT SUM( MENGE ) AS ISSUES FROM MSEG ` +
+              `WHERE MATBF = '${m}' AND WERKS = '${plant}' AND SHKZG = 'H' ` +
+              `AND BUDAT BETWEEN '${p.budatFrom}' AND '${p.budatTo}'`
+            ),
+          ])
+        : Promise.resolve(null);
+
       const [
         mapR, openMardhR, openMbewhR, closeMardhR, closeMbewhR,
-        msegR, stoInR, fgR, rtsR, taxR, mrpR, identityR,
+        msegSaleR, msegSaleRevR, msegStoOutR, mseg701R, mseg702R,
+        mseg561R, mseg562R, mseg309R,
+        stoInR, fgR, rtsR, taxR, mrpR, validateR,
       ] = await Promise.all([
-        // MAP — MBEW.VERPR (not I_ProductValuation)
+        // MAP — MBEW.VERPR
         this.runRawSql(`SELECT MATNR, VERPR FROM MBEW WHERE MATNR = '${m}' AND BWKEY = '${plant}' AND BWTAR = ''`),
         this.getMardhWithFallback(m, plant, p.openingLfgja),
         this.runRawSql(`SELECT BWKEY, LBKUM, SALK3 FROM MBEWH WHERE MATNR = '${m}' AND BWKEY = '${plant}' AND BWTAR = '' AND LFGJA = '${p.openingLfgja}' AND LFMON = '${p.openingLfmon}'`),
         this.getMardhWithFallback(m, plant, p.closingLfgja),
         this.runRawSql(`SELECT BWKEY, LBKUM, SALK3 FROM MBEWH WHERE MATNR = '${m}' AND BWKEY = '${plant}' AND BWTAR = '' AND LFGJA = '${p.closingLfgja}' AND LFMON = '${p.closingLfmon}'`),
-        // MSEG — all movements in one query (MATBF not MATNR, SALK3 for values)
+
+        // MSEG: one query per movement group — ADT freestyle does not support CASE WHEN
         this.runRawSql(
-          `SELECT BWART, SHKZG, XAUTO, MENGE, SALK3 FROM MSEG ` +
-          `WHERE MATBF = '${m}' AND WERKS = '${plant}' ` +
-          `AND BUDAT BETWEEN '${p.budatFrom}' AND '${p.budatTo}' ` +
-          `AND BWART IN ('251','252','309','310','561','562','601','602','631','632','633','634','641','653','701','702')`,
-          5000
+          `SELECT SUM( MENGE ) AS SALE_QTY FROM MSEG WHERE MATBF = '${m}' AND WERKS = '${plant}' ` +
+          `AND BWART IN ('251','601','633') AND SHKZG = 'H' ` +
+          `AND BUDAT BETWEEN '${p.budatFrom}' AND '${p.budatTo}'`
         ),
-        // STO Inward: MSEG 101 joined with EKKO STO document types
+        this.runRawSql(
+          `SELECT SUM( MENGE ) AS SALE_REV_QTY FROM MSEG WHERE MATBF = '${m}' AND WERKS = '${plant}' ` +
+          `AND BWART IN ('252','602','631','632','634','653') AND SHKZG = 'S' ` +
+          `AND BUDAT BETWEEN '${p.budatFrom}' AND '${p.budatTo}'`
+        ),
+        this.runRawSql(
+          `SELECT SUM( MENGE ) AS STO_OUT_QTY FROM MSEG WHERE MATBF = '${m}' AND WERKS = '${plant}' ` +
+          `AND BWART = '641' AND XAUTO = '' ` +
+          `AND BUDAT BETWEEN '${p.budatFrom}' AND '${p.budatTo}'`
+        ),
+        this.runRawSql(
+          `SELECT SUM( MENGE ) AS QTY_701 FROM MSEG WHERE MATBF = '${m}' AND WERKS = '${plant}' ` +
+          `AND BWART = '701' AND SHKZG = 'S' ` +
+          `AND BUDAT BETWEEN '${p.budatFrom}' AND '${p.budatTo}'`
+        ),
+        this.runRawSql(
+          `SELECT SUM( MENGE ) AS QTY_702, SUM( SALK3 ) AS VAL_702 FROM MSEG WHERE MATBF = '${m}' AND WERKS = '${plant}' ` +
+          `AND BWART = '702' AND SHKZG = 'H' ` +
+          `AND BUDAT BETWEEN '${p.budatFrom}' AND '${p.budatTo}'`
+        ),
+        this.runRawSql(
+          `SELECT SUM( MENGE ) AS QTY_561, SUM( SALK3 ) AS VAL_561 FROM MSEG WHERE MATBF = '${m}' AND WERKS = '${plant}' ` +
+          `AND BWART = '561' AND BUDAT BETWEEN '${p.budatFrom}' AND '${p.budatTo}'`
+        ),
+        this.runRawSql(
+          `SELECT SUM( MENGE ) AS QTY_562, SUM( SALK3 ) AS VAL_562 FROM MSEG WHERE MATBF = '${m}' AND WERKS = '${plant}' ` +
+          `AND BWART = '562' AND BUDAT BETWEEN '${p.budatFrom}' AND '${p.budatTo}'`
+        ),
+        this.runRawSql(
+          `SELECT SUM( MENGE ) AS QTY_309_310, SUM( SALK3 ) AS VAL_309_310 FROM MSEG WHERE MATBF = '${m}' AND WERKS = '${plant}' ` +
+          `AND BWART IN ('309','310') AND BUDAT BETWEEN '${p.budatFrom}' AND '${p.budatTo}'`
+        ),
+
+        // STO Inward — MSEG 101 + EKKO STO types
         this.runRawSql(
           `SELECT SUM( MSEG~MENGE ) AS STO_IN_QTY ` +
           `FROM MSEG INNER JOIN EKKO ON MSEG~EBELN = EKKO~EBELN ` +
@@ -278,14 +328,14 @@ export class DataHandlers extends BaseHandler {
           `AND MSEG~BUDAT BETWEEN '${p.budatFrom}' AND '${p.budatTo}' ` +
           `AND EKKO~BSART IN ('ZITR','ZITS','ZRTW','ZRTV','ZIBT','ZIBI','ZFRC','ZFRT','ZASI','ZAST','ZBAS')`
         ),
-        // FG PRDO — AFPO+AFKO join, WEMNG (not PSMNG), AFKO.STRMP (not DGLTP)
+        // FG PRDO — AFPO+AFKO join, WEMNG (not PSMNG), AFKO.STRMP date filter
         this.runRawSql(
           `SELECT SUM( AFPO~WEMNG ) AS FG_QTY, SUM( AFPO~WEWRT ) AS FG_VALUE ` +
           `FROM AFPO INNER JOIN AFKO ON AFPO~AUFNR = AFKO~AUFNR ` +
           `WHERE AFPO~PWERK = '${plant}' AND AFPO~MATNR = '${m}' ` +
           `AND AFKO~STRMP BETWEEN '${p.budatFrom}' AND '${p.budatTo}'`
         ),
-        // RTS — EKPO+EKKO, BSART without ZCAP/ZCON
+        // RTS — EKPO+EKKO, no ZCAP/ZCON
         this.runRawSql(
           `SELECT SUM( EKPO~MENGE ) AS RTS_QTY, SUM( EKPO~NETWR ) AS RTS_VALUE ` +
           `FROM EKPO INNER JOIN EKKO ON EKPO~EBELN = EKKO~EBELN ` +
@@ -300,13 +350,7 @@ export class DataHandlers extends BaseHandler {
           `AND VBRK~ERDAT BETWEEN '${p.budatFrom}' AND '${p.budatTo}'`
         ),
         mrpFetch,
-        validate
-          ? this.runRawSql(
-              `SELECT SUM( CASE WHEN SHKZG = 'S' THEN MENGE ELSE 0 END ) AS RECEIPTS, ` +
-              `SUM( CASE WHEN SHKZG = 'H' THEN MENGE ELSE 0 END ) AS ISSUES FROM MSEG ` +
-              `WHERE MATBF = '${m}' AND WERKS = '${plant}' AND BUDAT BETWEEN '${p.budatFrom}' AND '${p.budatTo}'`
-            )
-          : Promise.resolve(null),
+        validateFetch,
       ]);
 
       const map = Number(mapR?.values?.[0]?.VERPR) || 0;
@@ -315,35 +359,47 @@ export class DataHandlers extends BaseHandler {
       const closingQty   = this.sumLabst(closeMardhR);
       const openingValue = Number(openMbewhR?.values?.[0]?.SALK3) || openingQty * map;
       const closingValue = Number(closeMbewhR?.values?.[0]?.SALK3) || closingQty * map;
-      const buckets      = this.bucketMseg(msegR);
       const stoInQty     = Number(stoInR?.values?.[0]?.STO_IN_QTY) || 0;
       const fgPrdoQty    = Number(fgR?.values?.[0]?.FG_QTY) || 0;
       const fgPrdoValue  = Number(fgR?.values?.[0]?.FG_VALUE) || 0;
       const rtsQty       = Number(rtsR?.values?.[0]?.RTS_QTY) || 0;
       const rtsValue     = Number(rtsR?.values?.[0]?.RTS_VALUE) || 0;
       const taxableValue = Number(taxR?.values?.[0]?.TAXABLE_VALUE) || 0;
+      const saleQty      = Number(msegSaleR?.values?.[0]?.SALE_QTY) || 0;
+      const saleRevQty   = Number(msegSaleRevR?.values?.[0]?.SALE_REV_QTY) || 0;
+      const stoOutQty    = Number(msegStoOutR?.values?.[0]?.STO_OUT_QTY) || 0;
+      const qty701Up     = Number(mseg701R?.values?.[0]?.QTY_701) || 0;
+      const qty702Down   = Number(mseg702R?.values?.[0]?.QTY_702) || 0;
+      const val702       = Number(mseg702R?.values?.[0]?.VAL_702) || 0;
+      const qty561       = Number(mseg561R?.values?.[0]?.QTY_561) || 0;
+      const val561       = Number(mseg561R?.values?.[0]?.VAL_561) || 0;
+      const qty562       = Number(mseg562R?.values?.[0]?.QTY_562) || 0;
+      const val562       = Number(mseg562R?.values?.[0]?.VAL_562) || 0;
+      const qty309_310   = Number(mseg309R?.values?.[0]?.QTY_309_310) || 0;
+      const val309_310   = Number(mseg309R?.values?.[0]?.VAL_309_310) || 0;
 
       const result: any = {
         map, mrp,
         openingQty, openingValue,
         closingQty, closingValue,
-        stoOutQty:   buckets.stoOutQty,  stoOutValue:  buckets.stoOutQty * map,
-        stoInQty,                         stoInValue:   stoInQty * map,
-        saleQty:     buckets.saleQty,    saleMrpValue: buckets.saleQty * mrp,
-        saleRevQty:  buckets.saleRevQty, saleRevValue: buckets.saleRevQty * mrp,
-        qty701Up:    buckets.qty701Up,
-        qty702Down:  buckets.qty702Down, val702:        buckets.val702,
-        net561_562Qty:   buckets.net561_562Qty,
-        net561_562Value: buckets.net561_562Value,
-        qty309_310:  buckets.qty309_310, val309_310:   buckets.val309_310,
+        stoOutQty,            stoOutValue:      stoOutQty * map,
+        stoInQty,             stoInValue:       stoInQty * map,
+        saleQty,              saleMrpValue:     saleQty * mrp,
+        saleRevQty,           saleRevValue:     saleRevQty * mrp,
+        qty701Up,
+        qty702Down,           val702,
+        net561_562Qty:        qty561 - qty562,
+        net561_562Value:      val561 - val562,
+        qty309_310,           val309_310,
         fgPrdoQty, fgPrdoValue,
         rtsQty, rtsValue,
         taxableValue,
       };
 
-      if (validate && identityR) {
-        const receipts = Number(identityR?.values?.[0]?.RECEIPTS) || 0;
-        const issues   = Number(identityR?.values?.[0]?.ISSUES) || 0;
+      if (validate && validateR) {
+        const [receiptsR, issuesR] = validateR as any[];
+        const receipts = Number(receiptsR?.values?.[0]?.RECEIPTS) || 0;
+        const issues   = Number(issuesR?.values?.[0]?.ISSUES) || 0;
         const expected = openingQty + receipts - issues;
         result.balanceCheck = {
           expectedClosingQty: expected,
@@ -370,103 +426,148 @@ export class DataHandlers extends BaseHandler {
       const padded = (matnrs as string[]).map(x => String(x).padStart(18, '0'));
       const inList = padded.map(x => `'${x}'`).join(',');
 
-      // ── Round 1: all independent queries fire simultaneously ──────────────────
-      const [mapR, a938R, opMardhR, clMardhR, opMbewhR, clMbewhR, msegR, stoInR, rtsR, fgR, taxR] =
-        await Promise.all([
-          // MAP — MBEW.VERPR
-          this.runRawSql(
-            `SELECT MATNR, VERPR FROM MBEW WHERE MATNR IN (${inList}) AND BWKEY = '${plant}' AND BWTAR = ''`,
-            600
-          ),
-          // MRP step 1 — A938: all records for the materials; JS picks most-recent per MATNR
-          this.runRawSql(
-            `SELECT MATNR, KNUMH, DATAB FROM A938 WHERE KSCHL = 'ZMRP' AND KAPPL = 'V' AND MATNR IN (${inList})`,
-            5000
-          ),
-          // Opening stock qty — MARDH, SUM across LGORTs
-          this.runRawSql(
-            `SELECT MATNR, SUM( LABST ) AS OPENING_QTY FROM MARDH ` +
-            `WHERE MATNR IN (${inList}) AND WERKS = '${plant}' ` +
-            `AND LFGJA = '${p.openingLfgja}' AND LFMON = '${p.openingLfmon}' GROUP BY MATNR`,
-            600
-          ),
-          // Closing stock qty — MARDH
-          this.runRawSql(
-            `SELECT MATNR, SUM( LABST ) AS CLOSING_QTY FROM MARDH ` +
-            `WHERE MATNR IN (${inList}) AND WERKS = '${plant}' ` +
-            `AND LFGJA = '${p.closingLfgja}' AND LFMON = '${p.closingLfmon}' GROUP BY MATNR`,
-            600
-          ),
-          // Opening stock value — MBEWH.SALK3
-          this.runRawSql(
-            `SELECT MATNR, SALK3 AS OPENING_VALUE FROM MBEWH ` +
-            `WHERE MATNR IN (${inList}) AND BWKEY = '${plant}' AND BWTAR = '' ` +
-            `AND LFGJA = '${p.openingLfgja}' AND LFMON = '${p.openingLfmon}'`,
-            600
-          ),
-          // Closing stock value — MBEWH.SALK3
-          this.runRawSql(
-            `SELECT MATNR, SALK3 AS CLOSING_VALUE FROM MBEWH ` +
-            `WHERE MATNR IN (${inList}) AND BWKEY = '${plant}' AND BWTAR = '' ` +
-            `AND LFGJA = '${p.closingLfgja}' AND LFMON = '${p.closingLfmon}'`,
-            600
-          ),
-          // ALL MSEG movement columns in one query via conditional aggregation
-          this.runRawSql(
-            `SELECT MATBF, ` +
-            `SUM( CASE WHEN BWART IN ('251','601','633') AND SHKZG = 'H' THEN MENGE ELSE 0 END ) AS SALE_QTY, ` +
-            `SUM( CASE WHEN BWART IN ('252','602','631','632','634','653') AND SHKZG = 'S' THEN MENGE ELSE 0 END ) AS SALE_REV_QTY, ` +
-            `SUM( CASE WHEN BWART = '641' AND XAUTO = '' THEN MENGE ELSE 0 END ) AS STO_OUT_QTY, ` +
-            `SUM( CASE WHEN BWART = '701' AND SHKZG = 'S' THEN MENGE ELSE 0 END ) AS QTY_701, ` +
-            `SUM( CASE WHEN BWART = '702' AND SHKZG = 'H' THEN MENGE ELSE 0 END ) AS QTY_702, ` +
-            `SUM( CASE WHEN BWART = '702' AND SHKZG = 'H' THEN SALK3 ELSE 0 END ) AS VAL_702, ` +
-            `SUM( CASE WHEN BWART = '561' THEN MENGE ELSE 0 END ) AS QTY_561, ` +
-            `SUM( CASE WHEN BWART = '562' THEN MENGE ELSE 0 END ) AS QTY_562, ` +
-            `SUM( CASE WHEN BWART = '561' THEN SALK3 ELSE 0 END ) AS VAL_561, ` +
-            `SUM( CASE WHEN BWART = '562' THEN SALK3 ELSE 0 END ) AS VAL_562, ` +
-            `SUM( CASE WHEN BWART IN ('309','310') THEN MENGE ELSE 0 END ) AS QTY_309_310, ` +
-            `SUM( CASE WHEN BWART IN ('309','310') THEN SALK3 ELSE 0 END ) AS VAL_309_310 ` +
-            `FROM MSEG WHERE MATBF IN (${inList}) AND WERKS = '${plant}' ` +
-            `AND BUDAT BETWEEN '${p.budatFrom}' AND '${p.budatTo}' GROUP BY MATBF`,
-            2000
-          ),
-          // STO Inward — MSEG BWART=101 + EKKO STO types
-          this.runRawSql(
-            `SELECT MSEG~MATBF AS MATNR, SUM( MSEG~MENGE ) AS STO_IN_QTY ` +
-            `FROM MSEG INNER JOIN EKKO ON MSEG~EBELN = EKKO~EBELN ` +
-            `WHERE MSEG~MATBF IN (${inList}) AND MSEG~WERKS = '${plant}' ` +
-            `AND MSEG~BWART = '101' AND MSEG~XAUTO = '' ` +
-            `AND MSEG~BUDAT BETWEEN '${p.budatFrom}' AND '${p.budatTo}' ` +
-            `AND EKKO~BSART IN ('ZITR','ZITS','ZRTW','ZRTV','ZIBT','ZIBI','ZFRC','ZFRT','ZASI','ZAST','ZBAS') ` +
-            `GROUP BY MSEG~MATBF`,
-            2000
-          ),
-          // RTS — EKPO+EKKO, no ZCAP/ZCON
-          this.runRawSql(
-            `SELECT EKPO~MATNR, SUM( EKPO~MENGE ) AS RTS_QTY, SUM( EKPO~NETWR ) AS RTS_VALUE ` +
-            `FROM EKPO INNER JOIN EKKO ON EKPO~EBELN = EKKO~EBELN ` +
-            `WHERE EKPO~MATNR IN (${inList}) AND EKPO~WERKS = '${plant}' ` +
-            `AND EKKO~BSART IN ('ZDFG','ZMRP','ZPKG','ZPRO','ZRAW','ZRET','ZSER','ZSUB') ` +
-            `AND EKKO~AEDAT BETWEEN '${p.budatFrom}' AND '${p.budatTo}' GROUP BY EKPO~MATNR`,
-            2000
-          ),
-          // FG PRDO — AFPO+AFKO, WEMNG (not PSMNG), filter on AFKO.STRMP
-          this.runRawSql(
-            `SELECT AFPO~MATNR, SUM( AFPO~WEMNG ) AS FG_QTY, SUM( AFPO~WEWRT ) AS FG_VALUE ` +
-            `FROM AFPO INNER JOIN AFKO ON AFPO~AUFNR = AFKO~AUFNR ` +
-            `WHERE AFPO~MATNR IN (${inList}) AND AFPO~PWERK = '${plant}' ` +
-            `AND AFKO~STRMP BETWEEN '${p.budatFrom}' AND '${p.budatTo}' GROUP BY AFPO~MATNR`,
-            2000
-          ),
-          // Taxable Value — VBRP+VBRK, KZWI3
-          this.runRawSql(
-            `SELECT VBRP~MATNR, SUM( VBRP~KZWI3 ) AS TAXABLE_VALUE ` +
-            `FROM VBRP INNER JOIN VBRK ON VBRP~VBELN = VBRK~VBELN ` +
-            `WHERE VBRP~MATNR IN (${inList}) AND VBRP~WERKS = '${plant}' ` +
-            `AND VBRK~ERDAT BETWEEN '${p.budatFrom}' AND '${p.budatTo}' GROUP BY VBRP~MATNR`,
-            2000
-          ),
-        ]);
+      // ── All queries fire in parallel ──────────────────────────────────────────
+      // MSEG is split into one query per movement group because the SAP ADT
+      // datapreview freestyle endpoint does not support CASE WHEN expressions.
+      // Each split query has a narrow BWART filter, so it's faster anyway.
+      const [
+        mapR, a938R,
+        opMardhR, clMardhR, opMbewhR, clMbewhR,
+        msegSaleR, msegSaleRevR, msegStoOutR,
+        mseg701R, mseg702R, mseg561R, mseg562R, mseg309R,
+        stoInR, rtsR, fgR, taxR,
+      ] = await Promise.all([
+        // MAP — MBEW.VERPR (not I_ProductValuation, not MBEWH.VERPR)
+        this.runRawSql(
+          `SELECT MATNR, VERPR FROM MBEW WHERE MATNR IN (${inList}) AND BWKEY = '${plant}' AND BWTAR = ''`,
+          600
+        ),
+        // MRP step 1 — A938: all records; JS picks most-recent DATAB per MATNR
+        this.runRawSql(
+          `SELECT MATNR, KNUMH, DATAB FROM A938 WHERE KSCHL = 'ZMRP' AND KAPPL = 'V' AND MATNR IN (${inList})`,
+          5000
+        ),
+        // Opening stock qty — MARDH, SUM across all LGORTs
+        this.runRawSql(
+          `SELECT MATNR, SUM( LABST ) AS OPENING_QTY FROM MARDH ` +
+          `WHERE MATNR IN (${inList}) AND WERKS = '${plant}' ` +
+          `AND LFGJA = '${p.openingLfgja}' AND LFMON = '${p.openingLfmon}' GROUP BY MATNR`,
+          600
+        ),
+        // Closing stock qty — MARDH
+        this.runRawSql(
+          `SELECT MATNR, SUM( LABST ) AS CLOSING_QTY FROM MARDH ` +
+          `WHERE MATNR IN (${inList}) AND WERKS = '${plant}' ` +
+          `AND LFGJA = '${p.closingLfgja}' AND LFMON = '${p.closingLfmon}' GROUP BY MATNR`,
+          600
+        ),
+        // Opening stock value — MBEWH.SALK3
+        this.runRawSql(
+          `SELECT MATNR, SALK3 AS OPENING_VALUE FROM MBEWH ` +
+          `WHERE MATNR IN (${inList}) AND BWKEY = '${plant}' AND BWTAR = '' ` +
+          `AND LFGJA = '${p.openingLfgja}' AND LFMON = '${p.openingLfmon}'`,
+          600
+        ),
+        // Closing stock value — MBEWH.SALK3
+        this.runRawSql(
+          `SELECT MATNR, SALK3 AS CLOSING_VALUE FROM MBEWH ` +
+          `WHERE MATNR IN (${inList}) AND BWKEY = '${plant}' AND BWTAR = '' ` +
+          `AND LFGJA = '${p.closingLfgja}' AND LFMON = '${p.closingLfmon}'`,
+          600
+        ),
+
+        // ── MSEG: one query per movement group (no CASE WHEN — ADT does not support it) ──
+        this.runRawSql(
+          `SELECT MATBF, SUM( MENGE ) AS SALE_QTY FROM MSEG ` +
+          `WHERE MATBF IN (${inList}) AND WERKS = '${plant}' ` +
+          `AND BWART IN ('251','601','633') AND SHKZG = 'H' ` +
+          `AND BUDAT BETWEEN '${p.budatFrom}' AND '${p.budatTo}' GROUP BY MATBF`,
+          600
+        ),
+        this.runRawSql(
+          `SELECT MATBF, SUM( MENGE ) AS SALE_REV_QTY FROM MSEG ` +
+          `WHERE MATBF IN (${inList}) AND WERKS = '${plant}' ` +
+          `AND BWART IN ('252','602','631','632','634','653') AND SHKZG = 'S' ` +
+          `AND BUDAT BETWEEN '${p.budatFrom}' AND '${p.budatTo}' GROUP BY MATBF`,
+          600
+        ),
+        this.runRawSql(
+          `SELECT MATBF, SUM( MENGE ) AS STO_OUT_QTY FROM MSEG ` +
+          `WHERE MATBF IN (${inList}) AND WERKS = '${plant}' ` +
+          `AND BWART = '641' AND XAUTO = '' ` +
+          `AND BUDAT BETWEEN '${p.budatFrom}' AND '${p.budatTo}' GROUP BY MATBF`,
+          600
+        ),
+        this.runRawSql(
+          `SELECT MATBF, SUM( MENGE ) AS QTY_701 FROM MSEG ` +
+          `WHERE MATBF IN (${inList}) AND WERKS = '${plant}' ` +
+          `AND BWART = '701' AND SHKZG = 'S' ` +
+          `AND BUDAT BETWEEN '${p.budatFrom}' AND '${p.budatTo}' GROUP BY MATBF`,
+          600
+        ),
+        this.runRawSql(
+          `SELECT MATBF, SUM( MENGE ) AS QTY_702, SUM( SALK3 ) AS VAL_702 FROM MSEG ` +
+          `WHERE MATBF IN (${inList}) AND WERKS = '${plant}' ` +
+          `AND BWART = '702' AND SHKZG = 'H' ` +
+          `AND BUDAT BETWEEN '${p.budatFrom}' AND '${p.budatTo}' GROUP BY MATBF`,
+          600
+        ),
+        this.runRawSql(
+          `SELECT MATBF, SUM( MENGE ) AS QTY_561, SUM( SALK3 ) AS VAL_561 FROM MSEG ` +
+          `WHERE MATBF IN (${inList}) AND WERKS = '${plant}' ` +
+          `AND BWART = '561' AND BUDAT BETWEEN '${p.budatFrom}' AND '${p.budatTo}' GROUP BY MATBF`,
+          600
+        ),
+        this.runRawSql(
+          `SELECT MATBF, SUM( MENGE ) AS QTY_562, SUM( SALK3 ) AS VAL_562 FROM MSEG ` +
+          `WHERE MATBF IN (${inList}) AND WERKS = '${plant}' ` +
+          `AND BWART = '562' AND BUDAT BETWEEN '${p.budatFrom}' AND '${p.budatTo}' GROUP BY MATBF`,
+          600
+        ),
+        this.runRawSql(
+          `SELECT MATBF, SUM( MENGE ) AS QTY_309_310, SUM( SALK3 ) AS VAL_309_310 FROM MSEG ` +
+          `WHERE MATBF IN (${inList}) AND WERKS = '${plant}' ` +
+          `AND BWART IN ('309','310') AND BUDAT BETWEEN '${p.budatFrom}' AND '${p.budatTo}' GROUP BY MATBF`,
+          600
+        ),
+
+        // STO Inward — MSEG BWART=101 + EKKO STO document types
+        this.runRawSql(
+          `SELECT MSEG~MATBF AS MATNR, SUM( MSEG~MENGE ) AS STO_IN_QTY ` +
+          `FROM MSEG INNER JOIN EKKO ON MSEG~EBELN = EKKO~EBELN ` +
+          `WHERE MSEG~MATBF IN (${inList}) AND MSEG~WERKS = '${plant}' ` +
+          `AND MSEG~BWART = '101' AND MSEG~XAUTO = '' ` +
+          `AND MSEG~BUDAT BETWEEN '${p.budatFrom}' AND '${p.budatTo}' ` +
+          `AND EKKO~BSART IN ('ZITR','ZITS','ZRTW','ZRTV','ZIBT','ZIBI','ZFRC','ZFRT','ZASI','ZAST','ZBAS') ` +
+          `GROUP BY MSEG~MATBF`,
+          2000
+        ),
+        // RTS — EKPO+EKKO, ZCAP and ZCON excluded
+        this.runRawSql(
+          `SELECT EKPO~MATNR, SUM( EKPO~MENGE ) AS RTS_QTY, SUM( EKPO~NETWR ) AS RTS_VALUE ` +
+          `FROM EKPO INNER JOIN EKKO ON EKPO~EBELN = EKKO~EBELN ` +
+          `WHERE EKPO~MATNR IN (${inList}) AND EKPO~WERKS = '${plant}' ` +
+          `AND EKKO~BSART IN ('ZDFG','ZMRP','ZPKG','ZPRO','ZRAW','ZRET','ZSER','ZSUB') ` +
+          `AND EKKO~AEDAT BETWEEN '${p.budatFrom}' AND '${p.budatTo}' GROUP BY EKPO~MATNR`,
+          2000
+        ),
+        // FG PRDO — AFPO+AFKO, WEMNG (not PSMNG), date filter on AFKO.STRMP
+        this.runRawSql(
+          `SELECT AFPO~MATNR, SUM( AFPO~WEMNG ) AS FG_QTY, SUM( AFPO~WEWRT ) AS FG_VALUE ` +
+          `FROM AFPO INNER JOIN AFKO ON AFPO~AUFNR = AFKO~AUFNR ` +
+          `WHERE AFPO~MATNR IN (${inList}) AND AFPO~PWERK = '${plant}' ` +
+          `AND AFKO~STRMP BETWEEN '${p.budatFrom}' AND '${p.budatTo}' GROUP BY AFPO~MATNR`,
+          2000
+        ),
+        // Taxable Value — VBRP+VBRK, KZWI3
+        this.runRawSql(
+          `SELECT VBRP~MATNR, SUM( VBRP~KZWI3 ) AS TAXABLE_VALUE ` +
+          `FROM VBRP INNER JOIN VBRK ON VBRP~VBELN = VBRK~VBELN ` +
+          `WHERE VBRP~MATNR IN (${inList}) AND VBRP~WERKS = '${plant}' ` +
+          `AND VBRK~ERDAT BETWEEN '${p.budatFrom}' AND '${p.budatTo}' GROUP BY VBRP~MATNR`,
+          2000
+        ),
+      ]);
 
       // ── Round 2: MRP step 2 — KONP for the KNUMHs found in A938 ─────────────
       const mrpKnumhMap = this.buildMrpKnumhMap(a938R);
@@ -480,54 +581,68 @@ export class DataHandlers extends BaseHandler {
       }
 
       // ── Build lookup maps ─────────────────────────────────────────────────────
-      const mapLkp    = this.toLookupNum(mapR,    'MATNR', 'VERPR');
-      const mrpLkp    = this.buildMrpKbetrLookup(mrpKnumhMap, konpR);
-      const opQtyLkp  = this.toLookupNum(opMardhR, 'MATNR', 'OPENING_QTY');
-      const clQtyLkp  = this.toLookupNum(clMardhR, 'MATNR', 'CLOSING_QTY');
-      const opValLkp  = this.toLookupNum(opMbewhR, 'MATNR', 'OPENING_VALUE');
-      const clValLkp  = this.toLookupNum(clMbewhR, 'MATNR', 'CLOSING_VALUE');
-      const msegLkp   = this.toRowLookup(msegR,   'MATBF');
-      const stoInLkp  = this.toLookupNum(stoInR,  'MATNR', 'STO_IN_QTY');
-      const rtsLkp    = this.toRowLookup(rtsR,    'MATNR');
-      const fgLkp     = this.toRowLookup(fgR,     'MATNR');
-      const taxLkp    = this.toLookupNum(taxR,    'MATNR', 'TAXABLE_VALUE');
+      const mapLkp     = this.toLookupNum(mapR,       'MATNR', 'VERPR');
+      const mrpLkp     = this.buildMrpKbetrLookup(mrpKnumhMap, konpR);
+      const opQtyLkp   = this.toLookupNum(opMardhR,   'MATNR', 'OPENING_QTY');
+      const clQtyLkp   = this.toLookupNum(clMardhR,   'MATNR', 'CLOSING_QTY');
+      const opValLkp   = this.toLookupNum(opMbewhR,   'MATNR', 'OPENING_VALUE');
+      const clValLkp   = this.toLookupNum(clMbewhR,   'MATNR', 'CLOSING_VALUE');
+      const saleLkp    = this.toLookupNum(msegSaleR,   'MATBF', 'SALE_QTY');
+      const saleRevLkp = this.toLookupNum(msegSaleRevR,'MATBF', 'SALE_REV_QTY');
+      const stoOutLkp  = this.toLookupNum(msegStoOutR, 'MATBF', 'STO_OUT_QTY');
+      const q701Lkp    = this.toLookupNum(mseg701R,    'MATBF', 'QTY_701');
+      const q702Lkp    = this.toLookupNum(mseg702R,    'MATBF', 'QTY_702');
+      const v702Lkp    = this.toLookupNum(mseg702R,    'MATBF', 'VAL_702');
+      const q561Lkp    = this.toLookupNum(mseg561R,    'MATBF', 'QTY_561');
+      const v561Lkp    = this.toLookupNum(mseg561R,    'MATBF', 'VAL_561');
+      const q562Lkp    = this.toLookupNum(mseg562R,    'MATBF', 'QTY_562');
+      const v562Lkp    = this.toLookupNum(mseg562R,    'MATBF', 'VAL_562');
+      const q309Lkp    = this.toLookupNum(mseg309R,    'MATBF', 'QTY_309_310');
+      const v309Lkp    = this.toLookupNum(mseg309R,    'MATBF', 'VAL_309_310');
+      const stoInLkp   = this.toLookupNum(stoInR,      'MATNR', 'STO_IN_QTY');
+      const rtsLkp     = this.toRowLookup(rtsR,        'MATNR');
+      const fgLkp      = this.toRowLookup(fgR,         'MATNR');
+      const taxLkp     = this.toLookupNum(taxR,        'MATNR', 'TAXABLE_VALUE');
 
       // ── Assemble one row per material ─────────────────────────────────────────
       const rows = padded.map(matnr => {
-        const map = mapLkp[matnr]   ?? 0;
-        const mrp = mrpLkp[matnr]   ?? 0;
-        const opQty = opQtyLkp[matnr] ?? 0;
-        const clQty = clQtyLkp[matnr] ?? 0;
-        const opVal = opValLkp[matnr] ?? (opQty * map);
-        const clVal = clValLkp[matnr] ?? (clQty * map);
-        const ms = msegLkp[matnr] ?? {};
-        const stoOutQty = Number(ms.STO_OUT_QTY) || 0;
-        const stoInQty  = stoInLkp[matnr] ?? 0;
-        const saleQty   = Number(ms.SALE_QTY) || 0;
-        const saleRevQty = Number(ms.SALE_REV_QTY) || 0;
-        const rt = rtsLkp[matnr]  ?? {};
-        const fg = fgLkp[matnr]   ?? {};
+        const map    = mapLkp[matnr]    ?? 0;
+        const mrp    = mrpLkp[matnr]    ?? 0;
+        const opQty  = opQtyLkp[matnr]  ?? 0;
+        const clQty  = clQtyLkp[matnr]  ?? 0;
+        const opVal  = opValLkp[matnr]  ?? (opQty * map);
+        const clVal  = clValLkp[matnr]  ?? (clQty * map);
+        const saleQty    = saleLkp[matnr]    ?? 0;
+        const saleRevQty = saleRevLkp[matnr] ?? 0;
+        const stoOutQty  = stoOutLkp[matnr]  ?? 0;
+        const stoInQty   = stoInLkp[matnr]   ?? 0;
+        const qty561     = q561Lkp[matnr]    ?? 0;
+        const val561     = v561Lkp[matnr]    ?? 0;
+        const qty562     = q562Lkp[matnr]    ?? 0;
+        const val562     = v562Lkp[matnr]    ?? 0;
+        const rt = rtsLkp[matnr] ?? {};
+        const fg = fgLkp[matnr]  ?? {};
         return {
           matnr,
           map, mrp,
           openingQty: opQty,    openingValue: opVal,
           closingQty: clQty,    closingValue: clVal,
-          stoOutQty,            stoOutValue: stoOutQty * map,
-          stoInQty,             stoInValue:  stoInQty  * map,
-          saleQty,              saleMrpValue: saleQty  * mrp,
-          saleRevQty,           saleRevValue: saleRevQty * mrp,
-          qty701Up:   Number(ms.QTY_701)     || 0,
-          qty702Down: Number(ms.QTY_702)     || 0,
-          val702:     Number(ms.VAL_702)     || 0,
-          net561_562Qty:   (Number(ms.QTY_561) || 0) - (Number(ms.QTY_562) || 0),
-          net561_562Value: (Number(ms.VAL_561) || 0) - (Number(ms.VAL_562) || 0),
-          qty309_310: Number(ms.QTY_309_310) || 0,
-          val309_310: Number(ms.VAL_309_310) || 0,
-          rtsQty:     Number(rt.RTS_QTY)     || 0,
-          rtsValue:   Number(rt.RTS_VALUE)   || 0,
-          fgPrdoQty:  Number(fg.FG_QTY)      || 0,
-          fgPrdoValue:Number(fg.FG_VALUE)    || 0,
-          taxableValue: taxLkp[matnr] ?? 0,
+          stoOutQty,            stoOutValue:      stoOutQty * map,
+          stoInQty,             stoInValue:       stoInQty  * map,
+          saleQty,              saleMrpValue:     saleQty   * mrp,
+          saleRevQty,           saleRevValue:     saleRevQty * mrp,
+          qty701Up:             q701Lkp[matnr]   ?? 0,
+          qty702Down:           q702Lkp[matnr]   ?? 0,
+          val702:               v702Lkp[matnr]   ?? 0,
+          net561_562Qty:        qty561 - qty562,
+          net561_562Value:      val561 - val562,
+          qty309_310:           q309Lkp[matnr]   ?? 0,
+          val309_310:           v309Lkp[matnr]   ?? 0,
+          rtsQty:    Number(rt.RTS_QTY)           || 0,
+          rtsValue:  Number(rt.RTS_VALUE)         || 0,
+          fgPrdoQty: Number(fg.FG_QTY)            || 0,
+          fgPrdoValue: Number(fg.FG_VALUE)        || 0,
+          taxableValue: taxLkp[matnr]             ?? 0,
         };
       });
 
@@ -541,30 +656,6 @@ export class DataHandlers extends BaseHandler {
 
   private sumLabst(parsed: any): number {
     return (parsed?.values || []).reduce((s: number, r: any) => s + (Number(r.LABST) || 0), 0);
-  }
-
-  /** Buckets raw MSEG rows into named columns. Uses SALK3 for value fields. */
-  private bucketMseg(parsed: any) {
-    const b = {
-      stoOutQty: 0, saleQty: 0, saleRevQty: 0,
-      qty701Up: 0, qty702Down: 0, val702: 0,
-      net561_562Qty: 0, net561_562Value: 0,
-      qty309_310: 0, val309_310: 0,
-    };
-    for (const r of parsed?.values || []) {
-      const qty = Number(r.MENGE) || 0;
-      const val = Number(r.SALK3) || 0;
-      const bw = r.BWART; const sk = r.SHKZG;
-      if (bw === '641' && (r.XAUTO === '' || r.XAUTO == null)) b.stoOutQty += qty;
-      else if ((bw === '251' || bw === '601' || bw === '633') && sk === 'H') b.saleQty += qty;
-      else if ((bw === '252' || bw === '602' || bw === '631' || bw === '632' || bw === '634' || bw === '653') && sk === 'S') b.saleRevQty += qty;
-      else if (bw === '701' && sk === 'S') b.qty701Up += qty;
-      else if (bw === '702' && sk === 'H') { b.qty702Down += qty; b.val702 += val; }
-      else if (bw === '561') { b.net561_562Qty += qty; b.net561_562Value += val; }
-      else if (bw === '562') { b.net561_562Qty -= qty; b.net561_562Value -= val; }
-      else if (bw === '309' || bw === '310') { b.qty309_310 += qty; b.val309_310 += val; }
-    }
-    return b;
   }
 
   /** A938 result → MATNR→KNUMH map, keeping most-recent DATAB per material. */
